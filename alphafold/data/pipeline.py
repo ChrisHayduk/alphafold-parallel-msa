@@ -25,6 +25,7 @@ from alphafold.data.tools import hhblits
 from alphafold.data.tools import hhsearch
 from alphafold.data.tools import hmmsearch
 from alphafold.data.tools import jackhmmer
+import concurrent.futures
 import numpy as np
 
 # Internal import (7716).
@@ -150,80 +151,112 @@ class DataPipeline:
   def process(self, input_fasta_path: str, msa_output_dir: str) -> FeatureDict:
     """Runs alignment tools on the input sequence and creates features."""
     with open(input_fasta_path) as f:
-      input_fasta_str = f.read()
+        input_fasta_str = f.read()
     input_seqs, input_descs = parsers.parse_fasta(input_fasta_str)
     if len(input_seqs) != 1:
-      raise ValueError(
-          f'More than one input sequence found in {input_fasta_path}.')
+        raise ValueError(
+            f'More than one input sequence found in {input_fasta_path}.')
     input_sequence = input_seqs[0]
     input_description = input_descs[0]
     num_res = len(input_sequence)
 
+    # Prepare output paths
     uniref90_out_path = os.path.join(msa_output_dir, 'uniref90_hits.sto')
-    jackhmmer_uniref90_result = run_msa_tool(
-        msa_runner=self.jackhmmer_uniref90_runner,
-        input_fasta_path=input_fasta_path,
-        msa_out_path=uniref90_out_path,
-        msa_format='sto',
-        use_precomputed_msas=self.use_precomputed_msas,
-        max_sto_sequences=self.uniref_max_hits)
     mgnify_out_path = os.path.join(msa_output_dir, 'mgnify_hits.sto')
-    jackhmmer_mgnify_result = run_msa_tool(
-        msa_runner=self.jackhmmer_mgnify_runner,
-        input_fasta_path=input_fasta_path,
-        msa_out_path=mgnify_out_path,
-        msa_format='sto',
-        use_precomputed_msas=self.use_precomputed_msas,
-        max_sto_sequences=self.mgnify_max_hits)
+    if self._use_small_bfd:
+        bfd_out_path = os.path.join(msa_output_dir, 'small_bfd_hits.sto')
+    else:
+        bfd_out_path = os.path.join(msa_output_dir, 'bfd_uniref_hits.a3m')
 
+    # Run MSA tools in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        # Submit UniRef90 MSA job
+        uniref90_future = executor.submit(
+            run_msa_tool,
+            msa_runner=self.jackhmmer_uniref90_runner,
+            input_fasta_path=input_fasta_path,
+            msa_out_path=uniref90_out_path,
+            msa_format='sto',
+            use_precomputed_msas=self.use_precomputed_msas,
+            max_sto_sequences=self.uniref_max_hits
+        )
+
+        # Submit MGnify MSA job
+        mgnify_future = executor.submit(
+            run_msa_tool,
+            msa_runner=self.jackhmmer_mgnify_runner,
+            input_fasta_path=input_fasta_path,
+            msa_out_path=mgnify_out_path,
+            msa_format='sto',
+            use_precomputed_msas=self.use_precomputed_msas,
+            max_sto_sequences=self.mgnify_max_hits
+        )
+
+        # Submit BFD MSA job
+        if self._use_small_bfd:
+            bfd_future = executor.submit(
+                run_msa_tool,
+                msa_runner=self.jackhmmer_small_bfd_runner,
+                input_fasta_path=input_fasta_path,
+                msa_out_path=bfd_out_path,
+                msa_format='sto',
+                use_precomputed_msas=self.use_precomputed_msas
+            )
+        else:
+            bfd_future = executor.submit(
+                run_msa_tool,
+                msa_runner=self.hhblits_bfd_uniref_runner,
+                input_fasta_path=input_fasta_path,
+                msa_out_path=bfd_out_path,
+                msa_format='a3m',
+                use_precomputed_msas=self.use_precomputed_msas
+            )
+
+        # Wait for all futures to complete and get results
+        jackhmmer_uniref90_result = uniref90_future.result()
+        jackhmmer_mgnify_result = mgnify_future.result()
+        bfd_result = bfd_future.result()
+
+    # Process UniRef90 MSA for templates
     msa_for_templates = jackhmmer_uniref90_result['sto']
     msa_for_templates = parsers.deduplicate_stockholm_msa(msa_for_templates)
     msa_for_templates = parsers.remove_empty_columns_from_stockholm_msa(
         msa_for_templates)
 
+    # Template search
     if self.template_searcher.input_format == 'sto':
-      pdb_templates_result = self.template_searcher.query(msa_for_templates)
+        pdb_templates_result = self.template_searcher.query(msa_for_templates)
     elif self.template_searcher.input_format == 'a3m':
-      uniref90_msa_as_a3m = parsers.convert_stockholm_to_a3m(msa_for_templates)
-      pdb_templates_result = self.template_searcher.query(uniref90_msa_as_a3m)
+        uniref90_msa_as_a3m = parsers.convert_stockholm_to_a3m(msa_for_templates)
+        pdb_templates_result = self.template_searcher.query(uniref90_msa_as_a3m)
     else:
-      raise ValueError('Unrecognized template input format: '
-                       f'{self.template_searcher.input_format}')
+        raise ValueError('Unrecognized template input format: '
+                         f'{self.template_searcher.input_format}')
 
     pdb_hits_out_path = os.path.join(
         msa_output_dir, f'pdb_hits.{self.template_searcher.output_format}')
     with open(pdb_hits_out_path, 'w') as f:
-      f.write(pdb_templates_result)
+        f.write(pdb_templates_result)
 
+    # Parse MSAs
     uniref90_msa = parsers.parse_stockholm(jackhmmer_uniref90_result['sto'])
     mgnify_msa = parsers.parse_stockholm(jackhmmer_mgnify_result['sto'])
 
+    if self._use_small_bfd:
+        bfd_msa = parsers.parse_stockholm(bfd_result['sto'])
+    else:
+        bfd_msa = parsers.parse_a3m(bfd_result['a3m'])
+
+    # Get template hits
     pdb_template_hits = self.template_searcher.get_template_hits(
         output_string=pdb_templates_result, input_sequence=input_sequence)
 
-    if self._use_small_bfd:
-      bfd_out_path = os.path.join(msa_output_dir, 'small_bfd_hits.sto')
-      jackhmmer_small_bfd_result = run_msa_tool(
-          msa_runner=self.jackhmmer_small_bfd_runner,
-          input_fasta_path=input_fasta_path,
-          msa_out_path=bfd_out_path,
-          msa_format='sto',
-          use_precomputed_msas=self.use_precomputed_msas)
-      bfd_msa = parsers.parse_stockholm(jackhmmer_small_bfd_result['sto'])
-    else:
-      bfd_out_path = os.path.join(msa_output_dir, 'bfd_uniref_hits.a3m')
-      hhblits_bfd_uniref_result = run_msa_tool(
-          msa_runner=self.hhblits_bfd_uniref_runner,
-          input_fasta_path=input_fasta_path,
-          msa_out_path=bfd_out_path,
-          msa_format='a3m',
-          use_precomputed_msas=self.use_precomputed_msas)
-      bfd_msa = parsers.parse_a3m(hhblits_bfd_uniref_result['a3m'])
-
+    # Template features
     templates_result = self.template_featurizer.get_templates(
         query_sequence=input_sequence,
         hits=pdb_template_hits)
 
+    # Generate sequence and MSA features
     sequence_features = make_sequence_features(
         sequence=input_sequence,
         description=input_description,
