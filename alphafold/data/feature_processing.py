@@ -59,7 +59,9 @@ def pair_and_merge(
 
   process_unmerged_features(all_chain_features)
 
-  np_chains_list = list(all_chain_features.values())
+  # Ensure consistent ordering of chains by sorting the keys
+  sorted_chain_ids = sorted(all_chain_features.keys())
+  np_chains_list = [all_chain_features[chain_id] for chain_id in sorted_chain_ids]
 
   pair_msa_sequences = not _is_homomer_or_monomer(np_chains_list)
 
