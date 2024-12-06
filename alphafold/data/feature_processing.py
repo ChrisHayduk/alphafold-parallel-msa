@@ -48,14 +48,7 @@ def _is_homomer_or_monomer(chains: Iterable[pipeline.FeatureDict]) -> bool:
 def pair_and_merge(
     all_chain_features: MutableMapping[str, pipeline.FeatureDict]
     ) -> pipeline.FeatureDict:
-  """Runs processing on features to augment, pair and merge.
-
-  Args:
-    all_chain_features: A MutableMap of dictionaries of features for each chain.
-
-  Returns:
-    A dictionary of features.
-  """
+  """Runs processing on features to augment, pair and merge."""
 
   process_unmerged_features(all_chain_features)
 
@@ -66,9 +59,27 @@ def pair_and_merge(
   pair_msa_sequences = not _is_homomer_or_monomer(np_chains_list)
 
   if pair_msa_sequences:
-    np_chains_list = msa_pairing.create_paired_features(
-        chains=np_chains_list)
+    np_chains_list = msa_pairing.create_paired_features(chains=np_chains_list)
     np_chains_list = msa_pairing.deduplicate_unpaired_sequences(np_chains_list)
+
+  # **Fix Start: Ensure at least one MSA row per chain**
+  for chain_idx, chain_features in enumerate(np_chains_list):
+    if chain_features['msa'].shape[0] == 0:
+      # Reconstruct a minimal MSA containing only the query sequence
+      query_seq = chain_features['sequence'].tobytes().decode('utf-8')  # 'sequence' should be already a np.array of chars or a string. Adjust if needed.
+      query_encoded = np.array([[residue_constants.HHBLITS_AA_TO_ID[res] for res in query_seq]], dtype=np.int32)
+
+      chain_features['msa'] = query_encoded
+      chain_features['msa_mask'] = np.ones((1, query_encoded.shape[1]), dtype=np.float32)
+      chain_features['deletion_matrix'] = np.zeros((1, query_encoded.shape[1]), dtype=np.float32)
+      chain_features['num_alignments'] = np.array([1], dtype=np.int32)
+
+      # If you have *_all_seq features and pairing was intended, you can also set:
+      chain_features['msa_all_seq'] = query_encoded
+      chain_features['msa_mask_all_seq'] = np.ones((1, query_encoded.shape[1]), dtype=np.float32)
+      chain_features['deletion_matrix_all_seq'] = np.zeros((1, query_encoded.shape[1]), dtype=np.float32)
+      chain_features['num_alignments_all_seq'] = np.array([1], dtype=np.int32)
+
   np_chains_list = crop_chains(
       np_chains_list,
       msa_crop_size=MSA_CROP_SIZE,
